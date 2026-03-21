@@ -8,6 +8,7 @@ AbleSci自动签到脚本
 创建日期：2025年8月8日
 更新日期：2025年9月2日 >> 修复日志输出时间为北京时间 ; 修复签到前后用户信息显示 ; 优化登录失败处理 ; 优化签到已签到处理
 更新日期：2025年9月3日 >> 保护隐私，不在日志中显示完整邮箱和用户名
+更新日期：2026年3月22日 >> 支持本地.env文件; 使用zoneinfo/pytz处理时区; 统一通知器; 修复zoneinfo时区查找失败问题,增加回退机制; 修复已签到处理逻辑; 
 作者：daitcl
 """
 
@@ -18,15 +19,92 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import datetime
+from pathlib import Path
+from datetime import timezone, timedelta
 
-# 检测运行环境
-IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
-IS_QINGLONG = not IS_GITHUB_ACTIONS
 
-# 设置环境变量名称
-ENV_ACCOUNTS = "ABLESCI_ACCOUNTS" 
+try:
+    from zoneinfo import ZoneInfo
+    ZONEINFO_AVAILABLE = True
+except ImportError:
+    ZONEINFO_AVAILABLE = False
 
-# 隐私保护函数
+# 环境变量名常量
+ENV_ACCOUNTS = "ABLESCI_ACCOUNTS"
+
+def load_env_file():
+    """
+    加载脚本所在目录的 .env 文件，支持两种格式：
+    1. 标准键值对：KEY=VALUE
+    2. 无键账号行：直接写 邮箱:密码（自动归入 ABLESCI_ACCOUNTS）
+    
+    优先级：系统环境变量 > .env 中的标准键值对 > .env 中的无键账号行
+    重复键会合并（用换行符连接）
+    """
+    script_dir = Path(__file__).parent
+    env_file = script_dir / ".env"
+    if not env_file.exists():
+        return
+
+    env_vars = {}
+    account_lines = []
+
+    with open(env_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                if key in env_vars:
+                    env_vars[key] = env_vars[key] + "\n" + value
+                else:
+                    env_vars[key] = value
+            else:
+                account_lines.append(line)
+
+    for key, value in env_vars.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            print(f"已从 {env_file} 设置环境变量: {key}")
+        else:
+            print(f"环境变量 {key} 已存在（来自系统），跳过 .env 中的值")
+
+    if ENV_ACCOUNTS not in os.environ and ENV_ACCOUNTS not in env_vars:
+        if account_lines:
+            accounts_value = "\n".join(account_lines)
+            os.environ[ENV_ACCOUNTS] = accounts_value
+            print(f"已从 {env_file} 的无键行设置 {ENV_ACCOUNTS}（共 {len(account_lines)} 个账号）")
+    elif account_lines:
+        print(f"警告：存在无键账号行，但 {ENV_ACCOUNTS} 已通过系统或标准键值对设置，忽略无键行")
+
+    if ENV_ACCOUNTS in os.environ:
+        val = os.environ[ENV_ACCOUNTS]
+        print(f"当前 {ENV_ACCOUNTS} 内容预览: {val[:100]}{'...' if len(val) > 100 else ''}")
+
+load_env_file()
+
+def get_beijing_time():
+    """
+    返回北京时间（带时区信息）
+    优先使用 zoneinfo，如果失败则尝试 pytz，最后使用手动 UTC+8 偏移。
+    """
+    if ZONEINFO_AVAILABLE:
+        try:
+            return datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+        except Exception:
+            pass
+        
+    try:
+        import pytz
+        return datetime.datetime.now(pytz.timezone("Asia/Shanghai"))
+    except ImportError:
+        pass
+
+    return datetime.datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+
 def protect_privacy(text):
     """保护隐私信息，隐藏部分邮箱和用户名"""
     if not text:
@@ -47,24 +125,19 @@ def protect_privacy(text):
     else:
         return "***"
 
-# 消息通知系统
 class Notifier:
-    def __init__(self):
+    def __init__(self, title="科研通签到"):
         self.log_content = []
-        self.title = "科研通签到"
+        self.title = title
         self.notify_enabled = False
         
-        # 在所有环境尝试导入通知模块
         try:
-            # 添加当前目录到系统路径确保能导入
             sys.path.append(os.path.dirname(os.path.abspath(__file__)))
             from sendNotify import send
             self.send = send
             self.notify_enabled = True
         except ImportError:
-            # 在 GitHub Actions 中可能路径不同
             try:
-                # 尝试从父目录导入
                 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 sys.path.append(parent_dir)
                 from sendNotify import send
@@ -76,9 +149,7 @@ class Notifier:
     
     def log(self, message, level="info"):
         """格式化日志输出并保存到内容 - 使用北京时间"""
-        # 获取UTC时间并转换为北京时间 (UTC+8)
-        utc_now = datetime.datetime.utcnow()
-        beijing_time = utc_now + datetime.timedelta(hours=8)
+        beijing_time = get_beijing_time()
         timestamp = beijing_time.strftime("%Y-%m-%d %H:%M:%S")
         
         level_map = {
@@ -113,14 +184,14 @@ class Notifier:
         return "\n".join(self.log_content)
 
 class AbleSciAuto:
-    def __init__(self, email, password):
+    def __init__(self, email, password, notifier=None):
         self.session = requests.Session()
         self.email = email
         self.password = password
-        self.username = None  # 存储用户名
-        self.points = None    # 存储当前积分
-        self.sign_days = None # 存储连续签到天数
-        self.notifier = Notifier()
+        self.username = None
+        self.points = None
+        self.sign_days = None
+        self.notifier = notifier if notifier else Notifier()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
@@ -129,9 +200,8 @@ class AbleSciAuto:
             "X-Requested-With": "XMLHttpRequest"
         }
         self.start_time = time.time()
-        # 使用隐私保护函数处理邮箱显示
         protected_email = protect_privacy(self.email)
-        self.notifier.log(f"处理账号: {protected_email}", "info")
+        self.log(f"处理账号: {protected_email}", "info")
         
     def log(self, message, level="info"):
         """代理日志到通知系统"""
@@ -185,10 +255,8 @@ class AbleSciAuto:
                 timeout=30
             )
             
-            # 检查登录结果
             if response.status_code == 200:
                 try:
-                    # 尝试解析JSON响应
                     result = response.json()
                     if result.get("code") == 0:
                         self.log(f"登录成功: {result.get('msg')}", "success")
@@ -196,8 +264,7 @@ class AbleSciAuto:
                     else:
                         self.log(f"登录失败: {result.get('msg')}", "error")
                 except json.JSONDecodeError:
-                    # 如果不是JSON，可能是HTML响应
-                    if "退出" in response.text:  # 检查登录成功标志
+                    if "退出" in response.text:
                         self.log("登录成功", "success")
                         return True
                     else:
@@ -210,7 +277,6 @@ class AbleSciAuto:
 
     def get_user_info(self):
         """获取用户信息（包括用户名、积分和签到天数）"""
-        # 访问首页（登录后通常会显示用户名）
         home_url = "https://www.ablesci.com/"
         headers = self.headers.copy()
         headers["Referer"] = "https://www.ablesci.com/"
@@ -220,17 +286,16 @@ class AbleSciAuto:
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # 1. 获取用户名
+                # 用户名
                 username_element = soup.select_one('.mobile-hide.able-head-user-vip-username')
                 if username_element:
                     self.username = username_element.text.strip()
-                    # 使用隐私保护函数处理用户名显示
                     protected_username = protect_privacy(self.username)
                     self.log(f"用户名: {protected_username}", "info")
                 else:
                     self.log("无法定位用户名元素", "warning")
                 
-                # 2. 获取积分信息
+                # 积分
                 points_element = soup.select_one('#user-point-now')
                 if points_element:
                     self.points = points_element.text.strip()
@@ -238,7 +303,7 @@ class AbleSciAuto:
                 else:
                     self.log("无法获取积分信息", "warning")
                 
-                # 3. 获取连续签到天数
+                # 连续签到天数
                 sign_days_element = soup.select_one('#sign-count')
                 if sign_days_element:
                     self.sign_days = sign_days_element.text.strip()
@@ -254,7 +319,7 @@ class AbleSciAuto:
         return False
 
     def sign_in(self):
-        """执行签到操作 - 修复已签到处理"""
+        """执行签到操作 - 处理已签到情况"""
         sign_url = "https://www.ablesci.com/user/sign"
         headers = self.headers.copy()
         headers["Referer"] = "https://www.ablesci.com/"
@@ -265,9 +330,9 @@ class AbleSciAuto:
                 try:
                     result = response.json()
                     if result.get("code") == 0:
+                        msg = result.get("msg", "").replace("签到成功，", "", 1)
                         self.log(f"签到成功: {result.get('msg')}", "success")
                         
-                        # 尝试从响应中获取新的积分和签到天数
                         data = result.get("data", {})
                         if data:
                             if "points" in data:
@@ -276,12 +341,11 @@ class AbleSciAuto:
                             if "sign_days" in data:
                                 self.sign_days = data["sign_days"]
                                 self.log(f"更新连续签到天数: {self.sign_days}", "info")
-                        
                         return True
                     else:
                         msg = result.get('msg', '')
-                        # 特殊处理已签到情况
-                        if "已经签到" in msg or "已签到" in msg:
+                        if "您今天已于" in msg:
+                            msg = result.get("msg", "").replace("签到失败，", "", 1)
                             self.log(f"今日已签到: {msg}", "info")
                             return True
                         else:
@@ -301,37 +365,29 @@ class AbleSciAuto:
         self.log("=" * 50)
         self.log(f"用户 {protect_privacy(self.username)} {title}:")
         if self.username:
-            # 使用隐私保护函数处理用户名显示
-            protected_username = protect_privacy(self.username)
-            self.log(f"  • 用户名: {protected_username}")
+            self.log(f"  • 用户名: {protect_privacy(self.username)}")
         if self.points:
             self.log(f"  • 当前积分: {self.points}")
         if self.sign_days:
             self.log(f"  • 连续签到: {self.sign_days}天")
         self.log(f"  • 执行耗时: {elapsed}秒")
         self.log("=" * 50)
-        
-        # 添加额外空行
         self.log("")
 
     def run(self):
         """执行完整的登录和签到流程"""
         if self.login():
-            # 登录成功后获取并显示用户信息
             self.get_user_info()
             self.display_summary(is_before_sign=True)
             
-            # 执行签到
             sign_result = self.sign_in()
             
-            # 签到后刷新页面并再次获取用户信息
             if sign_result:
                 self.log("签到完成，刷新用户信息...", "info")
-                time.sleep(2)  # 等待2秒让服务器处理
+                time.sleep(2)
                 self.get_user_info()
                 self.display_summary(is_before_sign=False)
         
-        # 返回日志内容，供主程序汇总
         return self.notifier.get_content()
 
 def get_accounts():
@@ -340,14 +396,15 @@ def get_accounts():
     if not accounts_env:
         return []
     
+    # 调试输出
+    print(f"原始账号环境变量内容: {repr(accounts_env)}")
+    
     accounts = []
-    # 支持多种分隔符：换行符、分号、逗号
+    # 支持换行符、分号、逗号分隔
     for line in accounts_env.splitlines():
-        # 跳过空行
-        if not line.strip():
+        line = line.strip()
+        if not line:
             continue
-            
-        # 支持分号和逗号分隔的多个账号
         if ";" in line:
             accounts.extend(line.split(";"))
         elif "," in line:
@@ -355,9 +412,11 @@ def get_accounts():
         else:
             accounts.append(line)
     
-    # 验证账号格式并分离邮箱密码
     valid_accounts = []
     for account in accounts:
+        account = account.strip()
+        if not account:
+            continue
         # 支持邮箱和密码用冒号、分号或竖线分隔
         if ":" in account:
             email, password = account.split(":", 1)
@@ -366,23 +425,24 @@ def get_accounts():
         elif "|" in account:
             email, password = account.split("|", 1)
         else:
-            continue  # 跳过格式不正确的账号
+            print(f"警告：跳过格式错误的账号项: {account}")
+            continue
             
         email = email.strip()
         password = password.strip()
-        
         if email and password:
             valid_accounts.append((email, password))
+        else:
+            print(f"警告：账号或密码为空: {email}:{password}")
     
     return valid_accounts
 
 def main():
-    """主函数，处理多账号签到"""
-    # 创建全局通知器
-    global_notifier = Notifier()
+    """主函数，处理多账号签到，统一通知器"""
+    # 创建全局通知器，所有账号共享
+    global_notifier = Notifier("科研通多账号签到")
     global_notifier.log("科研通多账号签到任务开始", "info")
     
-    # 获取所有账号
     accounts = get_accounts()
     account_count = len(accounts)
     
@@ -395,33 +455,21 @@ def main():
     
     global_notifier.log(f"找到 {account_count} 个账号", "info")
     
-    # 执行每个账号的签到任务
-    all_logs = []
     for i, (email, password) in enumerate(accounts, 1):
         global_notifier.log(f"\n===== 开始处理第 {i}/{account_count} 个账号 =====", "info")
         
-        # 创建并执行签到实例
-        automator = AbleSciAuto(email, password)
-        account_log = automator.run()
-        all_logs.append(account_log)
+        automator = AbleSciAuto(email, password, notifier=global_notifier)
+        automator.run()
         
-        # 添加分隔符
         global_notifier.log(f"===== 完成第 {i}/{account_count} 个账号处理 =====", "info")
     
-    # 汇总所有日志
     global_notifier.log("\n===== 所有账号处理完成 =====", "info")
-    full_log = "\n\n".join(all_logs)
     
-    # 发送汇总通知
     if global_notifier.notify_enabled:
-        # 创建新通知器用于发送汇总通知
-        summary_notifier = Notifier()
-        summary_notifier.log_content = full_log.splitlines()
-        summary_notifier.send_notification()
+        global_notifier.send_notification()
     
-    # 在GitHub Actions环境中输出日志内容
-    if IS_GITHUB_ACTIONS:
-        print(f"::set-output name=log_content::{full_log}")
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        print(f"::set-output name=log_content::{global_notifier.get_content()}")
 
 if __name__ == "__main__":
     main()
